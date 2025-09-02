@@ -391,9 +391,9 @@ class CadFile(object):
             arcpy.AddMessage(f"[process_polylines_to_polygon] 1. Merge polyline vrstev do: {merged_fc}")
             arcpy.management.Merge(polyline_fcs, merged_fc)
             
-            # 2. Snap linií k sobě navzájem s tolerancí 30 cm pro spojení neuzavřených konců
-            arcpy.AddMessage("[process_polylines_to_polygon] 2. Snap linií k sobě navzájem (tolerance 30 cm)")
-            snap_env = [[merged_fc, "END", "0.3 Meters"]]
+            # 2. Snap linií k sobě navzájem s tolerancí 30 cm pro spojení neuzavřených konců (CASE I - pouze EDGE)
+            arcpy.AddMessage("[process_polylines_to_polygon] 2. Snap linií k hranám (EDGE) - tolerance 30 cm")
+            snap_env = [[merged_fc, "EDGE", "0.3 Meters"]]
             arcpy.edit.Snap(merged_fc, snap_env)
             
             # 3. Feature to Polygon - s kontrolou jedinečnosti názvu proti celé geodatabázi
