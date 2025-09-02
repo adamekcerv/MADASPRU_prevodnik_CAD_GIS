@@ -346,6 +346,11 @@ class CadFile(object):
                                 if updated_snapped_fc:
                                     # Polygon s atributem "bod" je výsledek, snapped linie se neukládá
                                     exported_layers.append(updated_snapped_fc)
+                                    
+                                    # Analýza "within" - kontrola zda menší polygony leží v řešeném území
+                                    if analysis_results and len(analysis_results) > 0:
+                                        main_analysis_fc = analysis_results[0]  # Resene_uzemi_with_Points
+                                        self.add_within_analysis(main_analysis_fc, updated_snapped_fc, output_workspace, out_prefix)
                                 # Ponechat původní bod pro referenci
                                 exported_layers.append(resene_point_fc)
                             else:
@@ -524,18 +529,31 @@ class CadFile(object):
             temp_resene_copy = "in_memory\\temp_resene_copy"
             arcpy.management.CopyFeatures(resene_line_fc, temp_resene_copy)
             
-            # 3. Snap původní linie k hranicím polygonu
-            arcpy.AddMessage(f"[snap_resene_line_to_polygon] 2. Přichycuji linii k hranicím polygonu (tolerance 1m)")
-            snap_env = [[temp_polygon_lines, "EDGE", "1 Meters"]]
-            arcpy.edit.Snap(temp_resene_copy, snap_env)
+            # 2.5. Densifikovat linii pro lepší snap výsledky
+            arcpy.AddMessage(f"[snap_resene_line_to_polygon] 2. Densifikuji linii pro lepší snap (každých 5m)")
+            arcpy.edit.Densify(temp_resene_copy, "DISTANCE", "5 Meters")
+            
+            # 3. Snap původní linie k hranicím polygonu - postupně s více tolerancemi
+            arcpy.AddMessage(f"[snap_resene_line_to_polygon] 3. Přichycuji linii k hranicím polygonu (EDGE + VERTEX)")
+            
+            # Nejprve snap k hranám s tolerancí 1m
+            snap_env1 = [[temp_polygon_lines, "EDGE", "1 Meters"]]
+            arcpy.edit.Snap(temp_resene_copy, snap_env1)
+            
+            # Pak snap k vrcholům s tolerancí 1m pro přesnější dopasování
+            snap_env2 = [[temp_polygon_lines, "VERTEX", "1 Meters"]]
+            arcpy.edit.Snap(temp_resene_copy, snap_env2)
             
             # 4. Vrácení dočasné snapped linie (bez uložení do geodatabáze)
-            arcpy.AddMessage(f"[snap_resene_line_to_polygon] 3. Snapped linie připravena pro další zpracování")
+            arcpy.AddMessage(f"[snap_resene_line_to_polygon] 4. Snapped linie připravena pro další zpracování")
             
             # 5. Vyčištění dočasných dat (kromě temp_resene_copy, kterou vracíme)
             arcpy.Delete_management(temp_polygon_lines)
             
-            arcpy.AddMessage(f"[snap_resene_line_to_polygon] Úspěšně vytvořena dočasná snapped linie pro zpracování polygonu")
+            arcpy.AddMessage(f"[snap_resene_line_to_polygon] Úspěšně vytvořena dočasná snapped linie s vylepšeným snappováním")
+            arcpy.AddMessage(f"[snap_resene_line_to_polygon] - Densifikace: každých 5m")
+            arcpy.AddMessage(f"[snap_resene_line_to_polygon] - Snap EDGE: tolerance 1m")
+            arcpy.AddMessage(f"[snap_resene_line_to_polygon] - Snap VERTEX: tolerance 1m")
             
             return temp_resene_copy  # Vrácení dočasné linie místo uložené
             
@@ -624,6 +642,91 @@ class CadFile(object):
         except Exception as e:
             arcpy.AddError(f"[process_resene_point_with_line] Chyba při zpracování: {e}")
             return None
+
+    def add_within_analysis(self, target_polygon_fc, main_polygon_fc, output_workspace, out_prefix):
+        """
+        Přidá analýzu "within" - kontroluje, zda polygony leží uvnitř hlavního polygonu řešeného území.
+        """
+        arcpy.AddMessage("[add_within_analysis] Začínám analýzu 'within' vůči hlavnímu polygonu řešeného území.")
+        
+        try:
+            # Debug informace o vstupních vrstvách
+            arcpy.AddMessage(f"[add_within_analysis] DEBUG: Target vrstva: {target_polygon_fc}")
+            arcpy.AddMessage(f"[add_within_analysis] DEBUG: Main vrstva: {main_polygon_fc}")
+            
+            # Debug informace
+            target_count = arcpy.GetCount_management(target_polygon_fc).getOutput(0)
+            main_count = arcpy.GetCount_management(main_polygon_fc).getOutput(0)
+            arcpy.AddMessage(f"[add_within_analysis] DEBUG: Target polygonů: {target_count}, Main polygonů: {main_count}")
+            
+            # Kontrola spatial reference
+            target_desc = arcpy.Describe(target_polygon_fc)
+            main_desc = arcpy.Describe(main_polygon_fc)
+            arcpy.AddMessage(f"[add_within_analysis] DEBUG: Target SR: {target_desc.spatialReference.name}")
+            arcpy.AddMessage(f"[add_within_analysis] DEBUG: Main SR: {main_desc.spatialReference.name}")
+            
+            # Debug informace o hlavním polygonu
+            with arcpy.da.SearchCursor(main_polygon_fc, ["SHAPE@"]) as cursor:
+                for row in cursor:
+                    main_shape = row[0]
+                    if main_shape:
+                        extent = main_shape.extent
+                        area = main_shape.area
+                        arcpy.AddMessage(f"[add_within_analysis] DEBUG: Main polygon - Area={area:.2f}, Extent: {extent.XMin:.2f},{extent.YMin:.2f} to {extent.XMax:.2f},{extent.YMax:.2f}")
+                    break
+            
+            # 1. Přidání pole "pozice_resene_uzemi"
+            arcpy.management.AddField(target_polygon_fc, "pozice_resene_uzemi", "TEXT", field_length=25)
+            
+            # 2. Select by Location (stejně jako manuální test v ArcGIS Pro)
+            arcpy.AddMessage(f"[add_within_analysis] 1. Select by Location (WITHIN) stejně jako manuální test")
+            
+            # Vytvoříme feature layer pro select by location
+            temp_layer = "temp_target_layer"
+            arcpy.management.MakeFeatureLayer(target_polygon_fc, temp_layer)
+            
+            # Select by Location - vybereme ty co jsou WITHIN
+            arcpy.management.SelectLayerByLocation(
+                in_layer=temp_layer,
+                overlap_type="WITHIN", 
+                select_features=main_polygon_fc,
+                selection_type="NEW_SELECTION"
+            )
+            
+            # Debug - kolik se vybere
+            selected_count = arcpy.GetCount_management(temp_layer).getOutput(0)
+            arcpy.AddMessage(f"[add_within_analysis] DEBUG: Select by Location vybralo {selected_count} polygonů jako WITHIN")
+            
+            # 3. Označíme vybrané jako "uvnitř řešeného území"
+            with arcpy.da.UpdateCursor(temp_layer, ["OBJECTID", "pozice_resene_uzemi"]) as cursor:
+                inside_count = 0
+                for row in cursor:
+                    row[1] = "uvnitř řešeného území"
+                    cursor.updateRow(row)
+                    inside_count += 1
+            
+            # 4. Vymažeme selection a označíme zbytek jako "mimo řešené území"
+            arcpy.management.SelectLayerByAttribute(temp_layer, "CLEAR_SELECTION")
+            
+            outside_count = 0
+            with arcpy.da.UpdateCursor(target_polygon_fc, ["OBJECTID", "pozice_resene_uzemi"]) as cursor:
+                for row in cursor:
+                    if row[1] is None or row[1] == "":  # Neoznačené = mimo
+                        row[1] = "mimo řešené území"
+                        cursor.updateRow(row)
+                        outside_count += 1
+            
+            total_count = inside_count + outside_count
+            
+            arcpy.AddMessage(f"[add_within_analysis] DEBUG: Uvnitř: {inside_count}, Mimo: {outside_count}, Celkem: {total_count}")
+            
+            # 5. Vyčištění dočasných dat
+            arcpy.Delete_management(temp_layer)
+            
+            arcpy.AddMessage(f"[add_within_analysis] Analýza 'within' dokončena - přidáno pole 'pozice_resene_uzemi'")
+            
+        except Exception as e:
+            arcpy.AddError(f"[add_within_analysis] Chyba při analýze within: {e}")
 
 
 class Toolbox(object):
@@ -723,6 +826,12 @@ class ExportLayer(object):
         transform_method = parameters[7].valueAsText
         out_prefix = parameters[8].valueAsText or ""
 
+        # Nastavení defaultního spatial reference na S-JTSK pokud není specifikován
+        if not output_sr:
+            output_sr = arcpy.SpatialReference(5514)  # S-JTSK / Krovak East North
+            arcpy.AddMessage(f"[execute] Používám defaultní souřadnicový systém: {output_sr.name} (EPSG:5514)")
+
+        # Vytvoření CAD objektu
         cad_file_obj = CadFile(input_cad)
 
         # Vytvoření Feature Datasetu pokud je specifikován
@@ -739,14 +848,12 @@ class ExportLayer(object):
                     arcpy.env.XYTolerance = f"{xy_tolerance} Meters"
                     arcpy.env.XYResolution = f"{xy_resolution} Meters"
                     
-                    if output_sr:
-                        arcpy.CreateFeatureDataset_management(
-                            out_dataset_path=output_gdb, 
-                            out_name=fd_name, 
-                            spatial_reference=output_sr
-                        )
-                    else:
-                        arcpy.CreateFeatureDataset_management(output_gdb, fd_name)
+                    # Vždy vytvoříme s definovaným spatial reference (buď uživatelem nebo S-JTSK)
+                    arcpy.CreateFeatureDataset_management(
+                        out_dataset_path=output_gdb, 
+                        out_name=fd_name, 
+                        spatial_reference=output_sr
+                    )
                     
                     # Obnovení původních hodnot prostředí
                     if original_xy_tolerance:
@@ -760,6 +867,9 @@ class ExportLayer(object):
             final_workspace = fd_path
         else:
             final_workspace = output_gdb
+
+        # Vytvoření CAD objektu
+        cad_file_obj = CadFile(input_cad)
 
         # Zpracování vybraných vrstev
         if selected_layers_text:
