@@ -303,11 +303,19 @@ class CadFile(object):
         polygon_fc = None
         if len(polylines_for_merge) >= 1:
             try:
-                polygon_fc = self.process_polylines_to_polygon(
-                    polylines_for_merge, output_workspace, out_prefix, spatial_ref
+                # Najít linii řešeného území pro novou strategii
+                resene_line_fc = None
+                for pl_fc in polylines_for_merge:
+                    if "101110_PL_Resene_uzemi" in os.path.basename(pl_fc):
+                        resene_line_fc = pl_fc
+                        break
+                
+                polygon_fc, main_polygon_fc = self.process_polylines_to_polygon(
+                    polylines_for_merge, resene_line_fc, output_workspace, out_prefix, spatial_ref
                 )
-                if polygon_fc:
+                if polygon_fc and main_polygon_fc:
                     exported_layers.append(polygon_fc)
+                    # main_polygon_fc je pouze dočasný - nebude se ukládat
                     # Zachovat obě původní polyline vrstvy
                     for pl_fc in polylines_for_merge:
                         exported_layers.append(pl_fc)
@@ -326,36 +334,31 @@ class CadFile(object):
                 if analysis_results:
                     exported_layers.extend(analysis_results)
                     
-                    # Přichycení původní linie Resene_uzemi k finálnímu polygonu
-                    resene_line_fc = None
-                    for pl_fc in polylines_for_merge:
-                        if "101110_PL_Resene_uzemi" in os.path.basename(pl_fc):
-                            resene_line_fc = pl_fc
-                            break
-                    
-                    if resene_line_fc:
-                        snapped_fc = self.snap_resene_line_to_polygon(
-                            polygon_fc, resene_line_fc, output_workspace, out_prefix
-                        )
-                        if snapped_fc:
-                            # Zpracování bodu Resene_uzemi s přichycenou linií
-                            if resene_point_fc:
-                                updated_snapped_fc = self.process_resene_point_with_line(
-                                    snapped_fc, resene_point_fc, output_workspace, out_prefix
-                                )
-                                if updated_snapped_fc:
-                                    # Polygon s atributem "bod" je výsledek, snapped linie se neukládá
-                                    exported_layers.append(updated_snapped_fc)
-                                    
-                                    # Analýza "within" - kontrola zda menší polygony leží v řešeném území
-                                    if analysis_results and len(analysis_results) > 0:
-                                        main_analysis_fc = analysis_results[0]  # Resene_uzemi_with_Points
-                                        self.add_within_analysis(main_analysis_fc, updated_snapped_fc, output_workspace, out_prefix)
-                                # Ponechat původní bod pro referenci
-                                exported_layers.append(resene_point_fc)
-                            else:
-                                # Pokud není bod, snapped linie se také neukládá
-                                pass
+                    # NOVÁ STRATEGIE: Místo snappování používáme už vytvořený hlavní polygon
+                    if main_polygon_fc:
+                        # Zpracování bodu Resene_uzemi s hlavním polygonem (přídání atributu "bod")
+                        if resene_point_fc:
+                            updated_main_polygon_fc = self.process_resene_point_with_polygon(
+                                main_polygon_fc, resene_point_fc, output_workspace, out_prefix
+                            )
+                            if updated_main_polygon_fc:
+                                # Polygon s atributem "bod" je výsledek
+                                exported_layers.append(updated_main_polygon_fc)
+                                
+                                # Analýza "within" - kontrola zda menší polygony leží v řešeném území
+                                if analysis_results and len(analysis_results) > 0:
+                                    main_analysis_fc = analysis_results[0]  # Resene_uzemi_with_Points
+                                    self.add_within_analysis(main_analysis_fc, updated_main_polygon_fc, output_workspace, out_prefix)
+                            # Ponechat původní bod pro referenci
+                            exported_layers.append(resene_point_fc)
+                        else:
+                            # Pokud není bod, použijeme hlavní polygon přímo
+                            exported_layers.append(main_polygon_fc)
+                            
+                            # Analýza "within" i bez bodu
+                            if analysis_results and len(analysis_results) > 0:
+                                main_analysis_fc = analysis_results[0]  # Resene_uzemi_with_Points
+                                self.add_within_analysis(main_analysis_fc, main_polygon_fc, output_workspace, out_prefix)
                     
                     # Smazat původní polygonovou vrstvu, protože máme už tu s body
                     try:
@@ -375,9 +378,13 @@ class CadFile(object):
         
         return exported_layers
 
-    def process_polylines_to_polygon(self, polyline_fcs, output_workspace, out_prefix, spatial_ref):
+    def process_polylines_to_polygon(self, polyline_fcs, resene_line_fc, output_workspace, out_prefix, spatial_ref):
         """
-        Zpracuje polyline vrstvy - merge, feature to polygon, integrate.
+        Zpracuje polyline vrstvy podle původní strategie + integrate:
+        1. Merge VŠECH linií (řešené území + části) → snap → Feature to Polygon → ZAPLNĚNÉ polygony
+        2. Samostatná linie řešeného území → Feature to Polygon → hlavní polygon
+        3. Merge obou sad polygonů → integrate → oddělení (bez hlavního polygonu)
+        Výsledek: zaplněné polygony s přesným napojením + dočasný hlavní polygon pro within analýzu.
         """
         arcpy.AddMessage("[process_polylines_to_polygon] Začínám speciální zpracování polyline vrstev.")
         
@@ -389,44 +396,99 @@ class CadFile(object):
             else:
                 root_gdb = output_workspace
             
-            # 1. Merge polyline vrstev
+            # 1. Merge VŠECH polyline vrstev (včetně linie řešeného území)
             merged_name = f"{out_prefix}Merged_Polylines" if out_prefix else "Merged_Polylines"
             merged_fc = os.path.join(output_workspace, generate_unique_fc_name(merged_name, root_gdb))
             
-            arcpy.AddMessage(f"[process_polylines_to_polygon] 1. Merge polyline vrstev do: {merged_fc}")
-            arcpy.management.Merge(polyline_fcs, merged_fc)
+            arcpy.AddMessage(f"[process_polylines_to_polygon] 1. Merge VŠECH polyline vrstev (včetně řešeného území) do: {merged_fc}")
+            arcpy.management.Merge(polyline_fcs, merged_fc)  # Všechny včetně resene_line_fc
             
-            # 2. Snap linií k sobě navzájem s tolerancí 30 cm pro spojení neuzavřených konců (CASE I - pouze EDGE)
+            # 2. Snap linií k sobě navzájem s tolerancí 30 cm pro spojení neuzavřených konců
             arcpy.AddMessage("[process_polylines_to_polygon] 2. Snap linií k hranám (EDGE) - tolerance 30 cm")
             snap_env = [[merged_fc, "EDGE", "0.3 Meters"]]
             arcpy.edit.Snap(merged_fc, snap_env)
             
-            # 3. Feature to Polygon - s kontrolou jedinečnosti názvu proti celé geodatabázi
-            polygon_name = f"{out_prefix}Resene_uzemi_PL" if out_prefix else "Resene_uzemi_PL"
-            unique_polygon_name = generate_unique_fc_name(polygon_name, root_gdb)
-            polygon_fc = os.path.join(output_workspace, unique_polygon_name)
+            # 3. Feature to Polygon z VŠECH mergnutých linií (zaplněný polygon)
+            temp_filled_polygons = "in_memory\\temp_filled_polygons"
             
-            arcpy.AddMessage(f"[process_polylines_to_polygon] 3. Feature to Polygon: {polygon_fc}")
+            arcpy.AddMessage(f"[process_polylines_to_polygon] 3. Feature to Polygon ze všech mergnutých linií (zaplněný)")
             arcpy.management.FeatureToPolygon(
                 in_features=merged_fc,
-                out_feature_class=polygon_fc,
+                out_feature_class=temp_filled_polygons,
                 cluster_tolerance="",
                 attributes="ATTRIBUTES"
             )
             
-            # 4. Integrate s tolerancí 30 cm
-            arcpy.AddMessage("[process_polylines_to_polygon] 4. Integrate s tolerancí 30 cm")
-            arcpy.management.Integrate([polygon_fc], "0.3 Meters")
+            # 4. Vytvoření polygonu z linie řešeného území (SAMOSTATNĚ pro integrate)
+            temp_main_polygon = "in_memory\\temp_main_polygon"
+            arcpy.AddMessage(f"[process_polylines_to_polygon] 4. Vytvářím polygon z linie řešeného území (pro integrate)")
+            arcpy.management.FeatureToPolygon(
+                in_features=resene_line_fc,  # POUZE linie řešeného území
+                out_feature_class=temp_main_polygon,
+                cluster_tolerance="",
+                attributes="ATTRIBUTES"
+            )
             
-            # Smazat dočasnou merged polyline vrstvu
+            # 5. Přidání označení pro identifikaci polygonů
+            arcpy.management.AddField(temp_filled_polygons, "polygon_type", "TEXT", field_length=20)
+            arcpy.management.AddField(temp_main_polygon, "polygon_type", "TEXT", field_length=20)
+            
+            with arcpy.da.UpdateCursor(temp_filled_polygons, ["polygon_type"]) as cursor:
+                for row in cursor:
+                    row[0] = "ZAPLNENE_POLYGONY"  # Zaplněné polygony z merged linií
+                    cursor.updateRow(row)
+                    
+            with arcpy.da.UpdateCursor(temp_main_polygon, ["polygon_type"]) as cursor:
+                for row in cursor:
+                    row[0] = "MAIN_RESENE_UZEMI"  # Hlavní polygon pro integrate
+                    cursor.updateRow(row)
+            
+            # 6. Merge všech polygonů pro společný integrate
+            all_polygons_temp = "in_memory\\all_polygons_temp"
+            
+            arcpy.AddMessage(f"[process_polylines_to_polygon] 5. Merge všech polygonů pro společný integrate")
+            arcpy.management.Merge([temp_filled_polygons, temp_main_polygon], all_polygons_temp)
+            
+            # 7. Integrate na všechny polygony najednou - zaručí správné geometrické napojení
+            arcpy.AddMessage("[process_polylines_to_polygon] 6. Integrate všech polygonů s tolerancí 30 cm")
+            arcpy.management.Integrate([all_polygons_temp], "0.3 Meters")
+            
+            # 8. Oddělení finálních polygonů (BEZ hlavního polygonu řešeného území)
+            parts_polygon_name = f"{out_prefix}Resene_uzemi_PL" if out_prefix else "Resene_uzemi_PL"
+            parts_polygon_fc = os.path.join(output_workspace, generate_unique_fc_name(parts_polygon_name, root_gdb))
+            
+            arcpy.AddMessage(f"[process_polylines_to_polygon] 7. Oddělení finálních polygonů (bez hlavního řešeného území)")
+            arcpy.analysis.Select(
+                in_features=all_polygons_temp,
+                out_feature_class=parts_polygon_fc,
+                where_clause="polygon_type = 'ZAPLNENE_POLYGONY'"
+            )
+            
+            # 9. Oddělení hlavního polygonu řešeného území (dočasně pro analýzu within)
+            main_polygon_temp = "in_memory\\main_polygon_integrated"
+            
+            arcpy.AddMessage(f"[process_polylines_to_polygon] 8. Oddělení hlavního polygonu řešeného území (dočasně)")
+            arcpy.analysis.Select(
+                in_features=all_polygons_temp,
+                out_feature_class=main_polygon_temp,
+                where_clause="polygon_type = 'MAIN_RESENE_UZEMI'"
+            )
+            
+            # 10. Vyčištění dočasných dat
             arcpy.Delete_management(merged_fc)
+            arcpy.Delete_management(temp_filled_polygons)
+            arcpy.Delete_management(temp_main_polygon)
+            arcpy.Delete_management(all_polygons_temp)
             
-            arcpy.AddMessage(f"[process_polylines_to_polygon] Úspěšně vytvořena polygonová vrstva: {polygon_fc}")
-            return polygon_fc
+            arcpy.AddMessage(f"[process_polylines_to_polygon] Úspěšně vytvořeny polygonové vrstvy:")
+            arcpy.AddMessage(f"[process_polylines_to_polygon] - Finální polygony: {parts_polygon_fc} (zaplněné, integrate napojené)")
+            arcpy.AddMessage(f"[process_polylines_to_polygon] - Hlavní řešené území: dočasný (pro within analýzu)")
+            
+            return parts_polygon_fc, main_polygon_temp
             
         except Exception as e:
             arcpy.AddError(f"[process_polylines_to_polygon] Chyba při zpracování: {e}")
-            return None
+            return None, None
 
     def perform_spatial_join_analysis(self, polygon_fc, point_fcs, output_workspace, out_prefix):
         """
@@ -533,16 +595,12 @@ class CadFile(object):
             arcpy.AddMessage(f"[snap_resene_line_to_polygon] 2. Densifikuji linii pro lepší snap (každých 5m)")
             arcpy.edit.Densify(temp_resene_copy, "DISTANCE", "5 Meters")
             
-            # 3. Snap původní linie k hranicím polygonu - postupně s více tolerancemi
-            arcpy.AddMessage(f"[snap_resene_line_to_polygon] 3. Přichycuji linii k hranicím polygonu (EDGE + VERTEX)")
+            # 3. Snap původní linie k hranicím polygonu - pouze EDGE pro hladké napojení
+            arcpy.AddMessage(f"[snap_resene_line_to_polygon] 3. Přichycuji linii k hranicím polygonu (pouze EDGE)")
             
-            # Nejprve snap k hranám s tolerancí 1m
-            snap_env1 = [[temp_polygon_lines, "EDGE", "1 Meters"]]
-            arcpy.edit.Snap(temp_resene_copy, snap_env1)
-            
-            # Pak snap k vrcholům s tolerancí 1m pro přesnější dopasování
-            snap_env2 = [[temp_polygon_lines, "VERTEX", "1 Meters"]]
-            arcpy.edit.Snap(temp_resene_copy, snap_env2)
+            # Snap k hranám s tolerancí 1m - vytvoří hladké napojení k polygonům
+            snap_env = [[temp_polygon_lines, "EDGE", "1 Meters"]]
+            arcpy.edit.Snap(temp_resene_copy, snap_env)
             
             # 4. Vrácení dočasné snapped linie (bez uložení do geodatabáze)
             arcpy.AddMessage(f"[snap_resene_line_to_polygon] 4. Snapped linie připravena pro další zpracování")
@@ -552,13 +610,82 @@ class CadFile(object):
             
             arcpy.AddMessage(f"[snap_resene_line_to_polygon] Úspěšně vytvořena dočasná snapped linie s vylepšeným snappováním")
             arcpy.AddMessage(f"[snap_resene_line_to_polygon] - Densifikace: každých 5m")
-            arcpy.AddMessage(f"[snap_resene_line_to_polygon] - Snap EDGE: tolerance 1m")
-            arcpy.AddMessage(f"[snap_resene_line_to_polygon] - Snap VERTEX: tolerance 1m")
+            arcpy.AddMessage(f"[snap_resene_line_to_polygon] - Snap EDGE: tolerance 1m (pouze hraně pro hladké napojení)")
             
             return temp_resene_copy  # Vrácení dočasné linie místo uložené
             
         except Exception as e:
             arcpy.AddError(f"[snap_resene_line_to_polygon] Chyba při snapping: {e}")
+            return None
+
+    def process_resene_point_with_polygon(self, main_polygon_fc, resene_point_fc, output_workspace, out_prefix):
+        """
+        Zpracuje bod Resene_uzemi s hlavním polygonem - spatial join, vrátí finální polygon s atributem "bod".
+        Hlavní polygon je pouze dočasný (in_memory), výsledkem je Resene_uzemi_Polygon_with_Points.
+        """
+        arcpy.AddMessage("[process_resene_point_with_polygon] Začínám zpracování bodu Resene_uzemi s hlavním polygonem.")
+        
+        try:
+            # Získání kořenové geodatabáze pro kontrolu jedinečnosti názvů
+            desc_ws = arcpy.Describe(output_workspace)
+            if desc_ws.datatype == "FeatureDataset":
+                root_gdb = os.path.dirname(output_workspace)
+            else:
+                root_gdb = output_workspace
+            
+            # 1. Spatial Join bodu k polygonu
+            temp_join = "in_memory\\temp_resene_polygon_join"
+            arcpy.AddMessage(f"[process_resene_point_with_polygon] 1. Spatial join bodu k hlavnímu polygonu")
+            arcpy.analysis.SpatialJoin(
+                target_features=main_polygon_fc,
+                join_features=resene_point_fc,
+                out_feature_class=temp_join,
+                join_operation="JOIN_ONE_TO_ONE",
+                join_type="KEEP_ALL",
+                match_option="CONTAINS"
+            )
+            
+            # 2. Přidání pole "bod" s hodnocením
+            arcpy.management.AddField(temp_join, "bod", "TEXT", field_length=20)
+            
+            arcpy.AddMessage("[process_resene_point_with_polygon] 2. Nastavuji hodnocení bodu")
+            with arcpy.da.UpdateCursor(temp_join, ["Join_Count", "bod"]) as cursor:
+                for row in cursor:
+                    join_count = row[0] if row[0] is not None else 0
+                    
+                    if join_count == 0:
+                        row[1] = "bez bodu"
+                    elif join_count == 1:
+                        row[1] = "v pořádku"
+                    else:
+                        row[1] = "více bodů"
+                    
+                    cursor.updateRow(row)
+            
+            # 3. Finální polygon řešeného území s atributem "bod"
+            final_polygon_name = f"{out_prefix}Resene_uzemi_Polygon_with_Points" if out_prefix else "Resene_uzemi_Polygon_with_Points"
+            final_polygon_fc = os.path.join(output_workspace, generate_unique_fc_name(final_polygon_name, root_gdb))
+            
+            arcpy.AddMessage(f"[process_resene_point_with_polygon] 3. Vytvářím finální polygon: {final_polygon_fc}")
+            arcpy.management.CopyFeatures(temp_join, final_polygon_fc)
+            
+            # Vyhodnocení výsledku pro reporting
+            with arcpy.da.SearchCursor(final_polygon_fc, ["bod"]) as cursor:
+                for row in cursor:
+                    hodnoceni = row[0]
+                    break
+            
+            arcpy.AddMessage(f"[process_resene_point_with_polygon] Analýza dokončena:")
+            arcpy.AddMessage(f"  - Hodnocení bodu: {hodnoceni}")
+            arcpy.AddMessage(f"  - Finální polygon: {os.path.basename(final_polygon_fc)}")
+            
+            # Vyčištění dočasných dat
+            arcpy.Delete_management(temp_join)
+            
+            return final_polygon_fc
+            
+        except Exception as e:
+            arcpy.AddError(f"[process_resene_point_with_polygon] Chyba při zpracování: {e}")
             return None
 
     def process_resene_point_with_line(self, snapped_line_fc, resene_point_fc, output_workspace, out_prefix):
