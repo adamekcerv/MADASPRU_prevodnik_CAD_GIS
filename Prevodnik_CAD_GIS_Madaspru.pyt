@@ -344,13 +344,13 @@ class CadFile(object):
                                     snapped_fc, resene_point_fc, output_workspace, out_prefix
                                 )
                                 if updated_snapped_fc:
-                                    # Snapped linie už má atribut "bod", nemusíme ji přidávat znovu
-                                    pass
+                                    # Polygon s atributem "bod" je výsledek, snapped linie se neukládá
+                                    exported_layers.append(updated_snapped_fc)
                                 # Ponechat původní bod pro referenci
                                 exported_layers.append(resene_point_fc)
-                            
-                            # Přidat snapped linii (s atributy, pokud byl zpracován bod)
-                            exported_layers.append(snapped_fc)
+                            else:
+                                # Pokud není bod, snapped linie se také neukládá
+                                pass
                     
                     # Smazat původní polygonovou vrstvu, protože máme už tu s body
                     try:
@@ -391,12 +391,17 @@ class CadFile(object):
             arcpy.AddMessage(f"[process_polylines_to_polygon] 1. Merge polyline vrstev do: {merged_fc}")
             arcpy.management.Merge(polyline_fcs, merged_fc)
             
-            # 2. Feature to Polygon - s kontrolou jedinečnosti názvu proti celé geodatabázi
+            # 2. Snap linií k sobě navzájem s tolerancí 30 cm pro spojení neuzavřených konců
+            arcpy.AddMessage("[process_polylines_to_polygon] 2. Snap linií k sobě navzájem (tolerance 30 cm)")
+            snap_env = [[merged_fc, "END", "0.3 Meters"]]
+            arcpy.edit.Snap(merged_fc, snap_env)
+            
+            # 3. Feature to Polygon - s kontrolou jedinečnosti názvu proti celé geodatabázi
             polygon_name = f"{out_prefix}Resene_uzemi_PL" if out_prefix else "Resene_uzemi_PL"
             unique_polygon_name = generate_unique_fc_name(polygon_name, root_gdb)
             polygon_fc = os.path.join(output_workspace, unique_polygon_name)
             
-            arcpy.AddMessage(f"[process_polylines_to_polygon] 2. Feature to Polygon: {polygon_fc}")
+            arcpy.AddMessage(f"[process_polylines_to_polygon] 3. Feature to Polygon: {polygon_fc}")
             arcpy.management.FeatureToPolygon(
                 in_features=merged_fc,
                 out_feature_class=polygon_fc,
@@ -404,8 +409,8 @@ class CadFile(object):
                 attributes="ATTRIBUTES"
             )
             
-            # 3. Integrate s tolerancí 30 cm
-            arcpy.AddMessage("[process_polylines_to_polygon] 3. Integrate s tolerancí 30 cm")
+            # 4. Integrate s tolerancí 30 cm
+            arcpy.AddMessage("[process_polylines_to_polygon] 4. Integrate s tolerancí 30 cm")
             arcpy.management.Integrate([polygon_fc], "0.3 Meters")
             
             # Smazat dočasnou merged polyline vrstvu
@@ -524,21 +529,15 @@ class CadFile(object):
             snap_env = [[temp_polygon_lines, "EDGE", "1 Meters"]]
             arcpy.edit.Snap(temp_resene_copy, snap_env)
             
-            # 4. Finální snapped linie
-            snapped_name = f"{out_prefix}Resene_uzemi_Snapped" if out_prefix else "Resene_uzemi_Snapped"
-            snapped_fc = os.path.join(output_workspace, generate_unique_fc_name(snapped_name, root_gdb))
+            # 4. Vrácení dočasné snapped linie (bez uložení do geodatabáze)
+            arcpy.AddMessage(f"[snap_resene_line_to_polygon] 3. Snapped linie připravena pro další zpracování")
             
-            arcpy.AddMessage(f"[snap_resene_line_to_polygon] 3. Vytvářím finální snapped linii: {snapped_fc}")
-            arcpy.management.CopyFeatures(temp_resene_copy, snapped_fc)
-            
-            # 5. Vyčištění dočasných dat
+            # 5. Vyčištění dočasných dat (kromě temp_resene_copy, kterou vracíme)
             arcpy.Delete_management(temp_polygon_lines)
-            arcpy.Delete_management(temp_resene_copy)
             
-            arcpy.AddMessage(f"[snap_resene_line_to_polygon] Úspěšně vytvořena snapped linie:")
-            arcpy.AddMessage(f"  - Výsledná vrstva: {os.path.basename(snapped_fc)}")
+            arcpy.AddMessage(f"[snap_resene_line_to_polygon] Úspěšně vytvořena dočasná snapped linie pro zpracování polygonu")
             
-            return snapped_fc
+            return temp_resene_copy  # Vrácení dočasné linie místo uložené
             
         except Exception as e:
             arcpy.AddError(f"[snap_resene_line_to_polygon] Chyba při snapping: {e}")
@@ -546,7 +545,7 @@ class CadFile(object):
 
     def process_resene_point_with_line(self, snapped_line_fc, resene_point_fc, output_workspace, out_prefix):
         """
-        Zpracuje bod Resene_uzemi s přichycenou linií - vytvoří polygon z linie, spatial join, zpět na linii.
+        Zpracuje bod Resene_uzemi s přichycenou linií - vytvoří polygon z linie, spatial join, vrátí polygon s atributem "bod".
         """
         arcpy.AddMessage("[process_resene_point_with_line] Začínám zpracování bodu Resene_uzemi s linií.")
         
@@ -597,52 +596,30 @@ class CadFile(object):
                     
                     cursor.updateRow(row)
             
-            # 4. Převedení zpět na linii (Polygon to Line)
-            temp_line = "in_memory\\temp_resene_line"
-            arcpy.AddMessage(f"[process_resene_point_with_line] 4. Převádím polygon zpět na linii")
-            arcpy.management.PolygonToLine(temp_join, temp_line)
+            # 4. Finální polygon řešeného území s atributem "bod"
+            final_polygon_name = f"{out_prefix}Resene_uzemi_Polygon_with_Points" if out_prefix else "Resene_uzemi_Polygon_with_Points"
+            final_polygon_fc = os.path.join(output_workspace, generate_unique_fc_name(final_polygon_name, root_gdb))
             
-            # 5. Přidání pole "bod" do liniové vrstvy a zkopírování hodnot z polygonu
-            arcpy.management.AddField(temp_line, "bod", "TEXT", field_length=20)
+            arcpy.AddMessage(f"[process_resene_point_with_line] 4. Vytvářím finální polygon: {final_polygon_fc}")
+            arcpy.management.CopyFeatures(temp_join, final_polygon_fc)
             
-            # Získat hodnotu "bod" z polygonové vrstvy
-            bod_value = None
-            with arcpy.da.SearchCursor(temp_join, ["bod"]) as cursor:
-                for row in cursor:
-                    bod_value = row[0]
-                    break  # Pouze první záznam, protože by měl být jen jeden polygon
-            
-            # Nastavit hodnotu "bod" ve všech liniových prvcích
-            if bod_value:
-                with arcpy.da.UpdateCursor(temp_line, ["bod"]) as cursor:
-                    for row in cursor:
-                        row[0] = bod_value
-                        cursor.updateRow(row)
-            
-            # 6. Nahrazení původní snapped linie touto s atributy
-            arcpy.AddMessage(f"[process_resene_point_with_line] 5. Nahrazuji původní snapped linii")
-            
-            # Přidat pole "bod" do původní snapped linie
-            arcpy.management.AddField(snapped_line_fc, "bod", "TEXT", field_length=20)
-            
-            # Zkopírovat hodnotu "bod" do původní snapped linie
-            if bod_value:
-                with arcpy.da.UpdateCursor(snapped_line_fc, ["bod"]) as cursor:
-                    for row in cursor:
-                        row[0] = bod_value
-                        cursor.updateRow(row)
-            
-            # 7. Vyčištění dočasných dat
+            # 5. Vyčištění dočasných dat (včetně snapped linie)
             arcpy.Delete_management(temp_polygon)
             arcpy.Delete_management(temp_join)
-            arcpy.Delete_management(temp_line)
+            arcpy.Delete_management(snapped_line_fc)  # Smazání dočasné snapped linie
             
-            # 8. Statistiky
+            # 6. Statistiky
+            bod_value = None
+            with arcpy.da.SearchCursor(final_polygon_fc, ["bod"]) as cursor:
+                for row in cursor:
+                    bod_value = row[0]
+                    break
+            
             arcpy.AddMessage(f"[process_resene_point_with_line] Analýza dokončena:")
             arcpy.AddMessage(f"  - Hodnocení bodu: {bod_value}")
-            arcpy.AddMessage(f"  - Atribut přidán do: {os.path.basename(snapped_line_fc)}")
+            arcpy.AddMessage(f"  - Finální polygon: {os.path.basename(final_polygon_fc)}")
             
-            return snapped_line_fc  # Vrácení stejné linie, ale s přidaným atributem
+            return final_polygon_fc  # Vrácení polygonu s atributem "bod"
             
         except Exception as e:
             arcpy.AddError(f"[process_resene_point_with_line] Chyba při zpracování: {e}")
